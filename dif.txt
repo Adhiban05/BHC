@@ -1,0 +1,1131 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <EEPROM.h>
+#include <PubSubClient.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <ArduinoJson.h>
+#include <FS.h>
+#include <time.h>  
+#include <HTTPClient.h>
+
+// WiFi
+const char* ssid = "Galaxy@23";
+const char* password = "11223341";
+
+// Motor and Torch
+#define RELAY1 18
+#define RELAY2 19 
+#define TORCH 17
+#define BUZZER 23
+
+bool inDosingPhase = false;
+
+// EEPROM
+#define EEPROM_SIZE 128
+String sysPassword = "1234";
+String dosingPassword = "1234";
+String dieselQty = "0000";
+String primingTime = "05";
+
+// MQTT
+const char* mqtt_server = "broker.emqx.io";
+const int mqtt_port = 1883;
+const char* mqtt_topic_status = "quantanics/status";
+//const char* mqtt_topic_info = "quantanics/info";
+//const char* mqtt_topic_sms = "quantanics/sms";
+
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+
+// OLED
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+String dosingDateStr = "";  // ✅ Define it globally
+char dateStr[11]; // YYYY-MM-DD
+
+
+unsigned long statusChangeTime = 0;
+bool statusDisplayed = false;
+
+String uiPage = "welcome";
+String inputBuffer = "";
+bool primingBPressed = false;
+bool motorRunning = false;
+unsigned long motorStartTime = 0;
+int motorDuration = 0;
+bool motorDirection = true;
+String adminBuffer = "";          // For admin password input
+String confirmPassword = "";     // For confirming new password
+bool isConfirming = false;       // Flag to check if in confirm phase
+String powerOffSeq = "";
+bool isDeprimingInProgress = false;
+bool deprimingCompleted = false;
+int editingMobile = 0;
+String dosingStartTimeStr = "";
+String dosingEndTimeStr = "";
+
+bool dosingPaused = false;
+unsigned long remainingDosingTime = 0;
+unsigned long dosingPauseTime = 0;
+
+WebServer server(80);
+
+// Dummy Data for UID and System Mobile
+String systemUID = "1234567890";
+String systemMobile = "9876543210";
+String mobile1 = "6380667287";
+String mobile2 = "638077690"; // Editable later
+String mobile3 = "9003538731"; // Editable later
+
+String getCurrentDate() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    return "00-00-0000";  // fallback
+  }
+  
+  strftime(dateStr, sizeof(dateStr), "%d-%m-%Y", &timeinfo);
+  return String(dateStr);
+}
+
+void setup() {
+  Serial.begin(115200);
+  EEPROM.begin(EEPROM_SIZE);
+
+  // Pin setup
+  pinMode(RELAY1, OUTPUT);
+  pinMode(RELAY2, OUTPUT);
+  pinMode(TORCH, OUTPUT);
+  pinMode(BUZZER, OUTPUT);
+  digitalWrite(RELAY1, LOW);
+  digitalWrite(RELAY2, LOW);
+  digitalWrite(BUZZER, HIGH);
+
+  // OLED initialization
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println(F("OLED not found"));
+    while (true);
+  }
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setTextColor(WHITE);
+  display.setCursor(10, 20);
+  display.println("Ionic Boost");
+  display.display();
+  delay(3000);
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("Starting...");
+  display.display();
+
+  // Read system password
+  char storedPwd[5];
+  for (int i = 0; i < 4; i++) storedPwd[i] = EEPROM.read(i);
+  storedPwd[4] = '\0';
+  sysPassword = String(storedPwd);
+
+  // Read diesel quantity
+  char diesel[5];
+  for (int i = 0; i < 4; i++) diesel[i] = EEPROM.read(60 + i);
+  diesel[4] = '\0';
+  dieselQty = String(diesel);
+
+  // Read priming time
+  char time[3];
+  for (int i = 0; i < 2; i++) time[i] = EEPROM.read(64 + i);
+  time[2] = '\0';
+  primingTime = String(time);
+
+  // Validate dieselQty
+  bool dieselValid = (dieselQty.length() == 4);
+  for (char c : dieselQty) {
+    if (!isDigit(c)) {
+      dieselValid = false;
+      break;
+    }
+  }
+  if (!dieselValid) {
+    dieselQty = "0000";
+    for (int i = 0; i < 4; i++) EEPROM.write(60 + i, dieselQty[i]);
+    EEPROM.commit();
+    Serial.println("EEPROM dieselQty initialized");
+  }
+
+  // Validate primingTime
+  bool timeValid = (primingTime.length() == 2);
+  for (char c : primingTime) {
+    if (!isDigit(c)) {
+      timeValid = false;
+      break;
+    }
+  }
+  if (!timeValid) {
+    primingTime = "10";
+    for (int i = 0; i < 2; i++) EEPROM.write(64 + i, primingTime[i]);
+    EEPROM.commit();
+    Serial.println("EEPROM primingTime initialized");
+  }
+
+  // Read mobile2
+  char m2[11];
+  for (int i = 0; i < 10; i++) m2[i] = EEPROM.read(30 + i);
+  m2[10] = '\0';
+  mobile2 = String(m2);
+  if (mobile2.length() != 10) mobile2 = "8888888888";
+
+  // Read mobile3
+  char m3[11];
+  for (int i = 0; i < 10; i++) m3[i] = EEPROM.read(40 + i);
+  m3[10] = '\0';
+  mobile3 = String(m3);
+  if (mobile3.length() != 10) mobile3 = "9999999999";
+
+  // Read dosing password
+  char dPwd[5];
+  for (int i = 0; i < 4; i++) dPwd[i] = EEPROM.read(50 + i);
+  dPwd[4] = '\0';
+  dosingPassword = String(dPwd);
+  if (dosingPassword.length() != 4 || dosingPassword == "FFFF") dosingPassword = "1234";
+
+  // WiFi & Time Sync
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(500);
+  }
+  Serial.println();
+  Serial.println("Connected to WiFi");
+
+  configTime(19800, 0, "pool.ntp.org", "time.nist.gov"); // IST
+
+  struct tm timeinfo;
+  int retries = 0;
+  while (!getLocalTime(&timeinfo) && retries < 10) {
+    Serial.println("Failed to obtain time");
+    delay(1000);
+    retries++;
+  }
+
+  if (retries < 10) {
+    Serial.println("Time sync successful!");
+    strftime(dateStr, sizeof(dateStr), "%Y-%m-%d", &timeinfo);
+    dosingDateStr = String(dateStr);
+    Serial.println("Current Date: " + dosingDateStr);
+  } else {
+    Serial.println("Time sync failed");
+  }
+
+  // Web Server
+  server.on("/", handleRoot);
+  server.on("/press", handleKeyPress);
+  server.begin();
+
+  // MQTT
+  mqttClient.setServer(mqtt_server, mqtt_port);
+  mqttClient.setBufferSize(512);
+
+  // OLED Final Message
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.println("Ionic Boost Ready");
+  display.display();
+
+  // Check EEPROM for default initialization
+  bool shouldInit = false;
+  for (int i = 0; i < 4; i++) {
+    if (EEPROM.read(i) == 0xFF) {
+      shouldInit = true;
+      break;
+    }
+  }
+  for (int i = 60; i < 64; i++) {
+    if (EEPROM.read(i) == 0xFF) {
+      shouldInit = true;
+      break;
+    }
+  }
+  for (int i = 64; i < 66; i++) {
+    if (EEPROM.read(i) == 0xFF) {
+      shouldInit = true;
+      break;
+    }
+  }
+
+  if (shouldInit) {
+    String defaultPass = "1234";
+    for (int i = 0; i < 4; i++) EEPROM.write(i, defaultPass[i]);
+
+    String defaultDiesel = "0045";
+    for (int i = 0; i < 4; i++) EEPROM.write(60 + i, defaultDiesel[i]);
+
+    String defaultTime = "10";
+    for (int i = 0; i < 2; i++) EEPROM.write(64 + i, defaultTime[i]);
+
+    EEPROM.commit();
+    Serial.println("EEPROM initialized with default values.");
+  }
+}
+
+
+void setupTime() {
+  // GMT+5:30 for India (19800 seconds)
+  configTime(19800, 0, "pool.ntp.org", "time.nist.gov");
+
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    Serial.println("Failed to get time");
+    return;
+  }
+
+  // Format date as "YYYY-MM-DD"
+  strftime(dateStr, sizeof(dateStr), "%Y-%m-%d", &timeinfo);
+
+  Serial.print("Stored Date: ");
+  Serial.println(dateStr);  // Example: 2025-07-29
+}
+
+
+// --- WhatsApp API Function ---
+void sendSmsApiRequest(String systemUID ,String dosingDateStr, String dosingStartTime, String dosingEndTime, String dieselQty, String phoneNumber) {
+  String phone = phoneNumber;
+  String uid = systemUID;
+  String startTime = dosingStartTime;
+  String endTime = dosingEndTime;
+  String qty = dieselQty;
+  String name = "IONIC_BOOST";
+  String date = dosingDateStr;
+
+  // Encode Params properly if they contain special characters
+  String params = uid + "," + date + "," + startTime + "," + endTime + "," + qty;
+
+  String url = "https://bhashsms.com/api/sendmsgutil.php";
+  url += "?user=terion_123";
+  url += "&pass=123456";
+  url += "&sender=BUZWAP";
+  url += "&phone=" + phone;
+  url += "&text=terion_iconic";
+  url += "&priority=wa";
+  url += "&stype=normal";
+  url += "&Params=" + params;
+
+  Serial.println("Calling URL:");
+  Serial.println(url);
+
+  HTTPClient http;
+  http.begin(url);
+
+  int httpResponseCode = http.GET();
+
+  if (httpResponseCode > 0) {
+    Serial.print("HTTP Response code: ");
+    Serial.println(httpResponseCode);
+    String response = http.getString();
+    Serial.println("SMS API Response:");
+    Serial.println(response);
+  } else {
+    Serial.print("Error on sending GET: ");
+    Serial.println(httpResponseCode);
+  }
+
+  http.end();
+}
+
+void reconnectMQTT() {
+  while (!mqttClient.connected()) {
+    Serial.print("Attempting MQTT connection...");
+    String clientId = "ESP32Client-" + String(random(0xffff), HEX);
+    if (mqttClient.connect(clientId.c_str())) {
+      Serial.println(" Connected to MQTT!");
+    } else {
+      Serial.print(" Failed, rc=");
+      Serial.print(mqttClient.state());
+      Serial.println(" try again in 5s");
+      delay(5000);
+    }
+  }
+}
+
+void beepOnce() {
+  digitalWrite(BUZZER, LOW);
+  delay(300);
+  digitalWrite(BUZZER, HIGH);
+}
+
+void beepTwice() {
+  for (int i = 0; i < 2; i++) {
+    digitalWrite(BUZZER, LOW);   // LOW = buzzer ON
+    delay(300);
+    digitalWrite(BUZZER, HIGH);  // HIGH = buzzer OFF
+    delay(200);
+  }
+  digitalWrite(BUZZER, HIGH); // Make sure it's off at the end
+}
+
+void loop() {
+  if (!mqttClient.connected()) reconnectMQTT();
+  mqttClient.loop();
+  server.handleClient();
+  updateOLEDStatus();
+
+  if (motorRunning && !dosingPaused && millis() - motorStartTime >= motorDuration) {
+    digitalWrite(RELAY1, LOW);
+    digitalWrite(RELAY2, LOW);
+    motorRunning = false;
+    beepOnce(); 
+    statusChangeTime = millis();
+    statusDisplayed = false;
+
+    if (uiPage == "priming_started") {
+      uiPage = "priming_menu";
+      inDosingPhase = true;
+      inputBuffer = "";
+    } else if (uiPage == "dosing_motor") {
+        // Capture end time
+        time_t now = time(nullptr);
+        struct tm* timeinfo = localtime(&now);
+
+        char timeBuf[9]; // HH:MM:SS
+        strftime(timeBuf, sizeof(timeBuf), "%H:%M:%S", timeinfo);
+        dosingEndTimeStr = String(timeBuf);
+
+        // Create custom JSON
+        StaticJsonDocument<256> doc;
+        doc["UID"] = systemUID;
+        doc["Date"] = dosingDateStr;
+        doc["Dosing_Start_Time"] = dosingStartTimeStr;
+        doc["Dosing_End_Time"] = dosingEndTimeStr;
+        doc["Diesel_Quantity_Used"] = String(dieselQty.toInt() * 0.008899, 2); // assuming ml to liters
+
+        char buffer[256];
+        serializeJson(doc, buffer);
+        bool success = mqttClient.publish(mqtt_topic_status, buffer);
+        Serial.print("MQTT Publish (Dosing Done): ");
+        String name = "IONIC_BOOST"; // or set dynamically
+        String uid = systemUID;
+        String date = dosingDateStr; // Replace with RTC if available
+        String startTime = dosingStartTimeStr;  // If tracked
+        String endTime = dosingEndTimeStr;    // If tracked
+        String qty =  String(dieselQty.toInt() * 0.008899, 2);
+
+        // Send to all mobiles
+        sendSmsApiRequest(systemUID, dosingDateStr, dosingStartTimeStr, dosingEndTimeStr, dieselQty, systemMobile);
+        sendSmsApiRequest(systemUID, dosingDateStr, dosingStartTimeStr, dosingEndTimeStr, dieselQty, mobile1);
+        sendSmsApiRequest(systemUID, dosingDateStr, dosingStartTimeStr, dosingEndTimeStr, dieselQty, mobile2);
+        sendSmsApiRequest(systemUID, dosingDateStr, dosingStartTimeStr, dosingEndTimeStr, dieselQty, mobile3);
+        Serial.println(success ? "✅ Success" : "❌ Failed");
+
+        // Display on OLED
+        display.clearDisplay();
+        display.setCursor(0, 0);
+        display.setTextSize(1);
+        display.println("Dosing Completed");
+        display.println("Date: " + dosingDateStr);
+        display.println("Start: " + dosingStartTimeStr);
+        display.println("End: " + dosingEndTimeStr);
+        display.println("Diesel: " + String(dieselQty.toInt() * 0.008899, 2) + " L");
+        display.display();
+
+        beepTwice();
+        statusChangeTime = millis();
+        uiPage = "priming_menu";
+        inDosingPhase = false;
+
+        beepTwice();
+
+        display.clearDisplay();
+        display.setCursor(0, 0);
+        display.setTextSize(1);
+        display.println("Dosing Completed");
+        display.println("Date: " + dosingDateStr);
+        display.println("Start: " + dosingStartTimeStr);
+        display.println("End: " + dosingEndTimeStr);
+        display.println("Diesel: " + String(dieselQty.toInt() * 0.008899, 2) + " L");
+        display.display();
+
+        statusChangeTime = millis();
+        uiPage = "priming_menu";
+        inDosingPhase = false;
+      }
+  else if (uiPage == "depriming_started") {
+    StaticJsonDocument<200> doc;
+    doc["status"] = "Depriming Stopped";
+    doc["priming_time"] = primingTime;
+    char buffer[256];
+    serializeJson(doc, buffer);
+    //mqttClient.publish(mqtt_topic_status, buffer);
+
+    uiPage = "welcome";            
+    dosingPaused = false;
+    remainingDosingTime = 0;
+
+    isDeprimingInProgress = false;   
+    deprimingCompleted = true;
+}
+
+
+    // OLED: Show done
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.println("Motor Stopped");
+    display.display();
+  }
+
+}
+
+void handleRoot() {
+  server.send(200, "text/html", getHtmlPage());
+}
+
+void handleKeyPress() {
+  String key = server.arg("key");
+
+  if (uiPage == "welcome") {
+    if (key == "5") {
+      digitalWrite(TORCH, !digitalRead(TORCH));
+    } else if (key == "*") {
+      uiPage = "password";
+      inputBuffer = "";
+    } else if (key == "1" || key == "8") {
+      powerOffSeq += key;
+      if (powerOffSeq == "18") {
+        uiPage = "power_off";
+        powerOffSeq = "";
+      } else if (powerOffSeq.length() > 2) {
+        powerOffSeq = "";
+      }
+    } else if (key == "B") {
+      uiPage = "admin_auth";
+      adminBuffer = "";
+    }
+
+  } else if (uiPage == "admin_auth") {
+    if (key == "#") {
+      if (adminBuffer == sysPassword) {
+        uiPage = "select_menu";
+      } else {
+        uiPage = "wrong_pass";
+      }
+      adminBuffer = "";
+    } else if (key == "*") {
+      adminBuffer = "";
+      uiPage = "welcome";
+    } else if (key == "C") {
+      inputBuffer = "";  
+    } else if (key.length() == 1 && adminBuffer.length() < 4) {
+      adminBuffer += key;
+    }
+
+  } else if (uiPage == "select_menu") {
+    if (key == "1") {
+    uiPage = "choose_mobile_to_edit";
+    inputBuffer = "";
+    editingMobile = 0;
+  } else if (key == "2") {
+      uiPage = "password_edit_menu"; 
+      inputBuffer = "";
+    }else if (key == "C") {
+      inputBuffer = "";  // Clear the input when 'C' is pressed
+  }else if (key == "#") {
+      uiPage = "welcome";
+    }
+
+  }else if (uiPage == "password_edit_menu") {
+  if (key == "1") {
+    uiPage = "edit_admin_password";
+    inputBuffer = "";
+  } else if (key == "2") {
+    uiPage = "edit_dosing_password";
+    inputBuffer = "";
+  }else if (key == "C") {
+      inputBuffer = "";  // Clear the input when 'C' is pressed
+  }
+   else if (key == "*") {
+    uiPage = "select_menu";
+  }
+} else if (uiPage == "choose_mobile_to_edit") {
+  if (key == "1") {
+    editingMobile = 1;
+    inputBuffer = "";
+    uiPage = "edit_mobile";
+  } else if (key == "2") {
+    editingMobile = 2;
+    inputBuffer = "";
+    uiPage = "edit_mobile";
+  }else if (key == "C") {
+      inputBuffer = "";  // Clear the input when 'C' is pressed
+  }else if (key == "*") {
+      uiPage = "select_menu";
+  }
+}
+  else if (uiPage == "edit_mobile") {
+  if (key == "#") {
+    if (inputBuffer.length() == 10 &&
+        inputBuffer != mobile1 &&
+        !inputBuffer.startsWith(" ") &&
+        inputBuffer.indexOf(' ') == -1) {
+
+      bool isValid = true;
+      for (char c : inputBuffer) {
+        if (!isDigit(c)) {
+          isValid = false;
+          break;
+        }
+      }
+
+      if (isValid && editingMobile != 0) {
+        if (editingMobile == 1) {
+          mobile2 = inputBuffer;
+          for (int i = 0; i < 10; i++) EEPROM.write(30 + i, mobile2[i]);
+        } else if (editingMobile == 2) {
+          mobile3 = inputBuffer;
+          for (int i = 0; i < 10; i++) EEPROM.write(40 + i, mobile3[i]);
+        }
+
+        EEPROM.commit();
+        inputBuffer = "";
+        editingMobile = 0;
+        uiPage = "choose_mobile_to_edit"; // ✅ Go back after editing
+      }
+    }
+
+  } else if (isDigit(key[0]) && inputBuffer.length() < 10) {
+    inputBuffer += key;
+
+  } else if (key == "C") {
+    inputBuffer = ""; // ✅ Clear input
+
+  } else if (key == "*") {
+    inputBuffer = "";
+    editingMobile = 0;
+    uiPage = "choose_mobile_to_edit"; // ✅ Back to mobile selection
+  }
+}
+ else if (uiPage == "password") {
+  if (key == "#") {
+    if (inputBuffer == dosingPassword) {
+      dieselQty = dieselQty;
+      primingTime = primingTime;
+      motorDirection = true;
+      inDosingPhase = false;
+
+      startMotor("priming");
+      
+    } else {
+      uiPage = "wrong_pass";
+    }
+    inputBuffer = "";
+  }
+  else if (key == "C") {
+    inputBuffer = "";  // Clear input
+  }
+  else if (key == "*") {
+    inputBuffer = "";  // Clear input
+    uiPage = "welcome";  // Go back to welcome
+  }
+  else if (key.length() == 1 && inputBuffer.length() < 4) {
+    inputBuffer += key;  // Append digit/letter
+  }
+}
+  else if (uiPage == "priming_menu") {
+  if (key == "A") {
+    uiPage = "edit_diesel";
+  } else if (key == "B") {
+    primingBPressed = true;
+    uiPage = "edit_priming";
+  } else if (key == "D" && !motorRunning && !dosingPaused) {
+    motorDirection = true;
+    inDosingPhase = true;
+
+    // Calculate calibration time
+    float calibratedTime = dieselQty.toInt() * 0.8899;
+    motorDuration = (unsigned long)(calibratedTime * 1000);
+    motorStartTime = millis();
+    motorRunning = true;
+
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo)) {
+      char buffer[10];
+      strftime(buffer, sizeof(buffer), "%H:%M:%S", &timeinfo);
+      dosingStartTimeStr = String(buffer);
+    }
+
+    StaticJsonDocument<200> doc;
+    doc["status"] = "Dosing Started";
+    doc["diesel_quantity"] = dieselQty;
+    doc["priming_time"] = String(calibratedTime, 2);
+    char buffer[256];
+    serializeJson(doc, buffer);
+    //mqttClient.publish(mqtt_topic_status, buffer);
+
+    digitalWrite(RELAY1, HIGH);  // +12V
+    digitalWrite(RELAY2, LOW);   // GND
+    beepOnce(); 
+
+    uiPage = "dosing_motor";
+
+  } else if (key == "#" && !motorRunning && !isDeprimingInProgress && key.length() == 1){
+    // 🔁 Start depriming
+    motorDirection = false; // Reverse direction
+    motorDuration = primingTime.toInt() * 1000;
+    motorStartTime = millis();
+    motorRunning = true;
+    isDeprimingInProgress = true;
+    inDosingPhase = false;
+
+    StaticJsonDocument<200> doc;
+    doc["status"] = "Depriming Started";
+    doc["priming_time"] = primingTime;
+    char buffer[256];
+    serializeJson(doc, buffer);
+    //mqttClient.publish(mqtt_topic_status, buffer);
+
+    digitalWrite(RELAY1, LOW);   // GND ✅
+    digitalWrite(RELAY2, HIGH);  // + 12ve
+    beepOnce();
+
+    uiPage = "depriming_started";
+  }
+}
+
+ else if (uiPage == "dosing_motor") {
+    if (key == "C") {
+      if (motorRunning && !dosingPaused) {
+        digitalWrite(RELAY1, LOW);
+        digitalWrite(RELAY2, LOW);
+        dosingPaused = true;
+        motorRunning = false;
+        beepOnce();
+        remainingDosingTime = motorDuration - (millis() - motorStartTime);
+
+        display.clearDisplay();
+        display.setCursor(0, 0);
+        display.println("Dosing Paused");
+        display.display();
+      } else if (!motorRunning && dosingPaused) {
+        motorDuration = remainingDosingTime;
+        motorStartTime = millis();
+        motorRunning = true;
+        dosingPaused = false;
+        beepOnce();
+
+        digitalWrite(RELAY1, HIGH);
+        digitalWrite(RELAY2, LOW);
+
+        display.clearDisplay();
+        display.setCursor(0, 0);
+        display.println("Dosing Resumed");
+        display.display();
+      }
+    }
+  } else if (uiPage == "edit_password") {
+    if (key == "#" && inputBuffer.length() == 4) {
+      sysPassword = inputBuffer;
+      for (int i = 0; i < 4; i++) EEPROM.write(i, sysPassword[i]);
+      EEPROM.commit();
+      uiPage = "priming_menu";
+      inputBuffer = "";
+    } else if (key.length() == 1 && inputBuffer.length() < 4) {
+      inputBuffer += key;
+    }
+    else if (key == "C") {
+    inputBuffer = "";  // Clear the input when 'C' is pressed
+  }
+  else if (key == "*") {
+    inputBuffer = "";
+    uiPage = "priming_menu"; // or "select_menu" depending on your flow
+  }
+  } else if (uiPage == "edit_diesel") {
+  if (key == "#" && inputBuffer.length() > 0) {
+    int qty = inputBuffer.toInt();
+
+    if (qty < 20 || qty > 2000) {
+      uiPage = "diesel_error";
+      inputBuffer = "";
+    } else {
+      while (inputBuffer.length() < 4) inputBuffer = "0" + inputBuffer;
+      dieselQty = inputBuffer;
+
+      // ✅ Save dieselQty to EEPROM (address 60 to 63)
+      for (int i = 0; i < 4; i++) EEPROM.write(60 + i, dieselQty[i]);
+      EEPROM.commit();  // Important!
+      Serial.println("Diesel committed: " + dieselQty);
+
+      inputBuffer = "";
+      uiPage = "priming_menu";
+    }
+  } else if (isDigit(key[0]) && inputBuffer.length() < 4) {
+    inputBuffer += key;
+  } else if (key == "C") {
+    inputBuffer = "";
+  } else if (key == "*") {
+    inputBuffer = "";
+    uiPage = "priming_menu";
+  }
+}
+else if (uiPage == "diesel_error") {
+  if (key == "*") {
+    inputBuffer = "";
+    uiPage = "priming_menu";
+  }
+}
+ else if (uiPage == "edit_priming") {
+    if (key == "#" && inputBuffer.length() > 0) {
+      // Ensure it's always 2 digits (e.g., "05")
+      while (inputBuffer.length() < 2) inputBuffer = "0" + inputBuffer;
+
+      primingTime = inputBuffer;
+
+      // Write to EEPROM (index 20, 21)
+      for (int i = 0; i < 2; i++) {
+        EEPROM.write(64 + i, primingTime[i]);
+      }
+        EEPROM.commit();
+
+        uiPage = "priming_menu";
+       inputBuffer = "";
+    } else if (isDigit(key[0]) && inputBuffer.length() < 2) {
+      inputBuffer += key;
+    }
+    else if (key == "*") {
+    inputBuffer = "";
+    uiPage = "priming_menu"; // or "select_menu" depending on your flow
+  }
+    else if (key == "C") {
+      inputBuffer = "";  // Clear the input when 'C' is pressed
+  }
+  } else if (uiPage == "dosing") {
+    if (key == "#" && inputBuffer.length() > 0) {
+      dieselQty = inputBuffer;
+      for (int i = 0; i < 4; i++) EEPROM.write(60 + i, dieselQty[i]);
+      EEPROM.commit();
+      inputBuffer = "";
+
+      motorDirection = true;
+      startMotor("dosing");
+    } else if (isDigit(key[0]) && inputBuffer.length() < 4) {
+      inputBuffer += key;
+    }
+
+  }else if (uiPage == "edit_admin_password") {
+  if (key == "#" && inputBuffer.length() == 4) {
+    sysPassword = inputBuffer;
+    for (int i = 0; i < 4; i++) EEPROM.write(i, sysPassword[i]);
+    EEPROM.commit();
+    inputBuffer = "";
+    uiPage = "select_menu";
+  }else if (key == "C") {
+      inputBuffer = "";  // Clear the input when 'C' is pressed
+  }
+   else if (key.length() == 1 && inputBuffer.length() < 4) {
+    inputBuffer += key;
+  } else if (key == "*") {
+    inputBuffer = "";
+    uiPage = "select_menu";
+  }
+}
+else if (uiPage == "edit_dosing_password") {
+  if (key == "#" && inputBuffer.length() == 4) {
+    dosingPassword = inputBuffer;
+    for (int i = 0; i < 4; i++) EEPROM.write(50 + i, dosingPassword[i]);
+    EEPROM.commit();
+    inputBuffer = "";
+    uiPage = "select_menu";
+  }else if (key == "C") {
+      inputBuffer = "";  // Clear the input when 'C' is pressed
+  }
+   else if (key.length() == 1 && inputBuffer.length() < 4) {
+    inputBuffer += key;
+  } else if (key == "*") {
+    inputBuffer = "";
+    uiPage = "select_menu";
+  }
+}
+  server.sendHeader("Location", "/", true);
+  server.send(302, "text/plain", "Redirecting...");
+}
+
+
+String getHtmlPage() {
+  String html = "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+  if (uiPage == "priming_started" || uiPage == "depriming_started" || uiPage == "dosing_motor") {
+  html += "<meta http-equiv='refresh' content='1'>";  // Reload every second
+}
+  html += "<style>";
+  html += "body { font-family: 'Segoe UI', sans-serif; margin: 0; background: linear-gradient(135deg, #74ebd5, #ACB6E5); }";
+  html += ".container { max-width: 480px; margin: 30px auto; background: white; padding: 20px; border-radius: 15px; box-shadow: 0 8px 20px rgba(0,0,0,0.2); }";
+  html += "h2 { text-align: center; color: #2c3e50; margin-bottom: 10px; }";
+  html += "p { text-align: center; color: #555; font-size: 18px; margin: 10px; }";
+  html += "table { margin: 20px auto; }";
+  html += "button { width: 60px; height: 60px; font-size: 22px; border-radius: 10px; background: #3498db; color: white; border: none; box-shadow: 2px 2px 8px rgba(0,0,0,0.2); transition: 0.3s; }";
+  html += "button:hover { background: #2980b9; }";
+  html += "form { display: inline; }";
+  html += ".input-box { text-align: center; font-size: 22px; letter-spacing: 10px; font-weight: bold; color: #2c3e50; background: #ecf0f1; padding: 10px 20px; border-radius: 8px; margin: 10px auto; width: fit-content; }";
+  html += "</style></head><body><div class='container'>";
+   html += "<img src='data:image/png;base64,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' style='width:100px; position:absolute; top:10px; left:10px;' />";
+  if (uiPage == "welcome") {
+    html += "<h2>IONIC BOOST</h2>";
+    html += "<p>Press '*' - ON <br>Press 'B' - Edit Mobile<br>Press '5' - TORCH ON<br>Press '9' - Power OFF</p>";
+  }
+  else if (uiPage == "power_off") {
+    html += "<h2 style='color:red;'>Powering Off...</h2>";
+    html += "<p>System shutting down...</p>";
+  }else if (uiPage == "password") {
+    html += "<h2>Enter Password</h2><div class='input-box'>" + inputBuffer + "</div>";
+  } else if (uiPage == "priming_menu") {
+    html += "<h2>Ready Menu</h2>";
+    html += "<p>'D' -  Dosing     | '#' - Back  </p>";
+    html += "<p>'A' - Edit Diesel | 'B' - Set Prime</p>";
+    html += "<p><b>Diesel:</b> " + dieselQty + " | <b>Time:</b> " + primingTime + "s</p>";
+  } else if (uiPage == "priming_done") {
+    html += "<h2> Motor Stopped</h2>";
+    uiPage = "priming_menu";
+  } else if (uiPage == "edit_password") {
+    html += "<h2> Change Password</h2><div class='input-box'>" + inputBuffer + "</div>";
+  } else if (uiPage == "edit_diesel") {
+    html += "<h2> Diesel Quantity</h2><div class='input-box'>" + inputBuffer + "</div>";
+    html += "<p>Press # to submit</p>";
+  } else if (uiPage == "edit_priming") {
+    html += "<h2> Priming Time (sec)</h2><div class='input-box'>" + inputBuffer + "</div>";
+    html += "<p>Press # to submit</p>";
+  } else if (uiPage == "wrong_pass") {
+    html += "<h2 style='color:red;'> Wrong Password</h2>";
+    uiPage = "welcome";
+  }else if (uiPage == "diesel_error") {
+    html += "<h2 style='color:red;'>Invalid Diesel Quantity</h2>";
+    html += "<p>Please enter a value between 20 and 2000</p>";
+    html += "<p>Press * to go back</p>";
+  }
+  else if (uiPage == "password_edit_menu") {
+    html += "<h2>Change Password</h2>";
+    html += "<p>1: Admin Password<br>2: Dosing Password<br>*: Back</p>";
+  }
+  else if (uiPage == "edit_admin_password") {
+    html += "<h2>Edit Admin Password</h2><div class='input-box'>" + inputBuffer + "</div>";
+    html += "<p>Press # to save</p>";
+  }
+  else if (uiPage == "edit_dosing_password") {
+    html += "<h2>Edit Dosing Password</h2><div class='input-box'>" + inputBuffer + "</div>";
+    html += "<p>Press # to save</p>";
+  }  
+  else if (uiPage == "priming_started") {
+    unsigned long remaining = max(0UL, motorDuration - (millis() - motorStartTime));
+
+    // Break down time into MM:SS:MS
+    unsigned int minutes = remaining / 60000;
+    unsigned int seconds = (remaining % 60000) / 1000;
+    unsigned int milliseconds = (remaining % 1000) / 10; // 2-digit ms
+
+    String timeStr = String(minutes) + ":" +
+                     (seconds < 10 ? "0" : "") + String(seconds) + ":" +
+                     (milliseconds < 10 ? "0" : "") + String(milliseconds);
+
+    html += "<h2>Priming Started</h2>";
+    html += "<p>Time Remaining: " + timeStr + "</p>";
+
+    if (remaining == 0) {
+        uiPage = "priming_menu";
+    }
+}
+ else if (uiPage == "depriming_started") {
+    unsigned long remaining = max(0UL, motorDuration - (millis() - motorStartTime));
+
+    // Format MM:SS:MS
+    unsigned int minutes = remaining / 60000;
+    unsigned int seconds = (remaining % 60000) / 1000;
+    unsigned int milliseconds = (remaining % 1000) / 10;
+
+    String timeStr = String(minutes) + ":" +
+                     (seconds < 10 ? "0" : "") + String(seconds) + ":" +
+                     (milliseconds < 10 ? "0" : "") + String(milliseconds);
+
+    html += "<h2>Depriming...</h2>";
+    html += "<p>Time Remaining: " + timeStr + "</p>";
+
+    if (remaining == 0) {
+        uiPage = "welcome";
+    }
+} 
+else if (uiPage == "motor_stopped") {
+    html += "<h2>Motor Stopped</h2>";
+    uiPage = "priming_menu";
+}
+
+  else if (uiPage == "choose_mobile_to_edit") {
+  html += "<h2>Select Mobile to Edit</h2>";
+  html += "<p>1: " + mobile2 + " (Editable)<br>";
+  html += "2: " + mobile3 + " (Editable)<br>";
+  html += "*: Back</p>";
+}
+  else if (uiPage == "dosing") {
+    html += "<h2>Enter Dosing Qty</h2><div class='input-box'>" + inputBuffer + "</div>";
+    html += "<p>Enter Quantity, then press #</p>";
+  }
+  else if (uiPage == "dosing_motor") {
+    unsigned long remaining = 0;
+    if (motorRunning) {
+        remaining = max(0UL, motorDuration - (millis() - motorStartTime));
+        
+    } else if (dosingPaused) {
+        remaining = remainingDosingTime;
+    }
+
+    // Format MM:SS:MS
+    unsigned int minutes = remaining / 60000;
+    unsigned int seconds = (remaining % 60000) / 1000;
+    unsigned int milliseconds = (remaining % 1000) / 10;
+
+    String timeStr = String(minutes) + ":" +
+                     (seconds < 10 ? "0" : "") + String(seconds) + ":" +
+                     (milliseconds < 10 ? "0" : "") + String(milliseconds);
+
+    html += "<h2>Dosing in Progress</h2>";
+    html += "<p>Time Remaining: " + timeStr + "</p>";
+}
+else if (uiPage == "admin_auth") {
+    html += "<h2>Enter Admin Password</h2><div class='input-box'>" + adminBuffer + "</div>";
+    html += "<p>Press # to submit</p>";
+  }
+  else if (uiPage == "select_menu") {
+    html += "<h2>SELECT MENU</h2>";
+    html += "<p>Press 1: Edit Mobile No.<br>Press 2: Edit Password<br>Press #: Back</p>";
+  }
+  else if (uiPage == "edit_mobile") {
+    html += "<h2>Edit Mobile No.</h2><div class='input-box'>" + inputBuffer + "</div>";
+    html += "Press # to Confirm</p>";
+  }
+  else if (uiPage == "edit_password_admin") {
+    html += "<h2>Edit Password</h2><div class='input-box'>" + inputBuffer + "</div>";
+    if (isConfirming) {
+      html += "<p>Confirm: " + confirmPassword + "</p>";
+    } else {
+        html += "<p>Press * after entering 9 characters to confirm</p>";
+      }
+}
+
+
+  html += "<table>";
+  const char* keys[4][4] = {
+    { "1", "2", "3", "A" },
+    { "4", "5", "6", "B" },
+    { "7", "8", "9", "C" },
+    { "*", "0", "#", "D" }
+  };
+
+  for (int i = 0; i < 4; i++) {
+    html += "<tr>";
+    for (int j = 0; j < 4; j++) {
+      html += "<td><form action=\"/press\" method=\"get\">";
+      html += "<input type=\"hidden\" name=\"key\" value=\"" + String(keys[i][j]) + "\">";
+      html += "<button type=\"submit\">" + String(keys[i][j]) + "</button></form></td>";
+    }
+    html += "</tr>";
+  }
+
+  html += "</table></div></body></html>";
+  return html;
+}
+
+
+void startMotor(String taskType) {
+  motorDuration = primingTime.toInt() * 1000;
+  motorStartTime = millis();
+  motorRunning = true;
+
+  StaticJsonDocument<200> doc;
+  doc["diesel_quantity"] = dieselQty;
+  doc["priming_time"] = primingTime;
+
+  // Determine direction
+  if (taskType == "priming") {
+    doc["status"] = "Priming Started";
+    beepOnce();
+    uiPage = "priming_started";
+
+    // Forward: RELAY1 = HIGH (+12V), RELAY2 = LOW (GND)
+    Serial.println("Activating relay...");
+    digitalWrite(RELAY1, HIGH);
+    Serial.println("Relay activated.");
+    digitalWrite(RELAY2, LOW);
+
+  } else if (taskType == "depriming") {
+    doc["status"] = "Depriming Started";
+    beepOnce();
+    uiPage = "depriming_started";
+
+    // Reverse: RELAY1 = LOW (GND), RELAY2 = HIGH (+12V)
+    digitalWrite(RELAY1, LOW);
+    digitalWrite(RELAY2, HIGH);
+
+  } else if (taskType == "dosing") {
+    doc["status"] = "Dosing Started";
+    beepOnce();
+    uiPage = "dosing_motor";
+    inDosingPhase = true;
+    uiPage = "welcome";
+
+    // You can set default direction if needed
+    digitalWrite(RELAY1, HIGH);
+    digitalWrite(RELAY2, LOW);
+  }
+
+  char buffer[256];
+  serializeJson(doc, buffer);
+  //mqttClient.publish(mqtt_topic_status, buffer);
+
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.setTextSize(1);
+  display.println(doc["status"].as<String>());
+  display.println("Diesel: " + dieselQty);
+  display.println("Time: " + primingTime + "s");
+  display.display();
+}
+
+void updateOLEDStatus() {
+  if (!motorRunning && !dosingPaused) return;
+
+  unsigned long remaining = 0;
+  if (motorRunning) {
+    remaining = max(0UL, motorDuration - (millis() - motorStartTime));
+  } else if (dosingPaused) {
+    remaining = remainingDosingTime;
+  }
+
+  // Convert milliseconds to MM:SS:MS format
+  unsigned int minutes = remaining / 60000;
+  unsigned int seconds = (remaining % 60000) / 1000;
+  unsigned int milliseconds = (remaining % 1000) / 10; // 2-digit ms
+
+  String timeStr = String(minutes) + ":" +
+                   (seconds < 10 ? "0" : "") + String(seconds) + ":" +
+                   (milliseconds < 10 ? "0" : "") + String(milliseconds);
+
+  String totalTimeStr = String(motorDuration / 60000) + ":" +
+                        ((motorDuration % 60000) / 1000 < 10 ? "0" : "") +
+                        String((motorDuration % 60000) / 1000) + ":" +
+                        "00";  // Always ends with ":00" since total doesn't include ms
+
+  String operation = "";
+  if (uiPage == "priming_started") operation = "Priming";
+  else if (uiPage == "depriming_started") operation = "Depriming";
+  else if (uiPage == "dosing_motor") operation = "Dosing";
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("Op: " + operation);
+  display.println("Time Left: " + timeStr);
+  display.println("Total: " + totalTimeStr);
+  display.println("Diesel: " + dieselQty);
+  if (dosingPaused) {
+    display.setTextColor(WHITE, BLACK);
+    display.println("Paused");
+  }
+  display.display();
+}
